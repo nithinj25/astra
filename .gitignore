@@ -1,0 +1,41 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+.Python
+pip-log.txt
+
+# Model — included intentionally (pre-trained, ~1 MB)
+# ids/model.pkl  ← do NOT ignore
+
+# Node / frontend
+dashboard/frontend/node_modules/
+dashboard/frontend/dist/
+dashboard/frontend/.vite/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Env files
+.env
+.env.*
