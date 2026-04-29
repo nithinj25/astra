@@ -8,19 +8,23 @@ NOTE: Uses thread-based UDP receive to work around Windows ProactorEventLoop
       run_coroutine_threadsafe.
 
 Simulation API:
-    POST /api/simulate  { "action": "normal|arm|gps|mode|all|stop" }
+    POST /api/simulate  { "action": "normal|arm|gps|mode|param|mission|spoof|all|stop" }
     GET  /api/sim_status
+    GET  /api/telemetry
+    GET  /api/events/recent?limit=50
 """
 import asyncio
 import struct
 import threading
 import time
+import math
 import logging
 import argparse
 import os
 import sys
 import random
 import socket as _socket
+from collections import deque
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -41,17 +45,45 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [IDS] %(message)s")
 logger = logging.getLogger("ids")
 
 # ── MAVLink constants ─────────────────────────────────────────────────────────
-HEARTBEAT    = 0
-SET_MODE     = 11
-COMMAND_LONG = 76
-GPS_INPUT    = 232
+HEARTBEAT     = 0
+SET_MODE      = 11
+PARAM_SET     = 23
+MISSION_ITEM  = 39
+MISSION_COUNT = 44
+COMMAND_LONG  = 76
+GPS_INPUT     = 232
 
-MSG_NAMES = {0: "HEARTBEAT", 11: "SET_MODE", 76: "COMMAND_LONG", 232: "GPS_INPUT"}
-CRC_EXTRA = {HEARTBEAT: 50, SET_MODE: 89, COMMAND_LONG: 152, GPS_INPUT: 151}
+MSG_NAMES = {
+    0:   "HEARTBEAT",
+    11:  "SET_MODE",
+    23:  "PARAM_SET",
+    39:  "MISSION_ITEM",
+    44:  "MISSION_COUNT",
+    76:  "COMMAND_LONG",
+    232: "GPS_INPUT",
+}
+
+CRC_EXTRA = {
+    HEARTBEAT:     50,
+    SET_MODE:      89,
+    PARAM_SET:     168,
+    MISSION_ITEM:  254,
+    MISSION_COUNT: 221,
+    COMMAND_LONG:  152,
+    GPS_INPUT:     151,
+}
+
 CMD_ARM_DISARM = 400
 _IDS_PORT = 14551
 
 _pkt_seq = 0
+
+# ── Orbital flight constants ──────────────────────────────────────────────────
+HOME_LAT     = 37.7749
+HOME_LON     = -122.4194
+ORBIT_R_LAT  = 0.0021     # ~233m radius — stays within 300m geofence
+ORBIT_R_LON  = 0.0026     # ~228m at this latitude
+ORBIT_OMEGA  = 0.021      # rad/s → period ~299s, speed ~5 m/s
 
 
 def mavlink_crc(data: bytes) -> int:
@@ -101,6 +133,31 @@ def _mode_change(mode: int = 6, sys_id: int = 99) -> bytes:
     return _build(SET_MODE, struct.pack("<IBB", mode, 1, 217), sys_id)
 
 
+def _param_set(param_id: str, value: float, sys_id: int = 99) -> bytes:
+    payload = struct.pack(
+        "<f16sBBB",
+        value,
+        param_id.encode().ljust(16, b'\x00'),
+        1, 1, 9,
+    )
+    return _build(PARAM_SET, payload, sys_id)
+
+
+def _mission_count(count: int, sys_id: int = 99) -> bytes:
+    payload = struct.pack("<HBBB", count, 1, 0, 0)
+    return _build(MISSION_COUNT, payload, sys_id)
+
+
+def _mission_item(seq: int, lat: float, lon: float, alt: float, sys_id: int = 99) -> bytes:
+    payload = struct.pack(
+        "<fffffffiiHHBBBBB",
+        0, 0, 0, 0,
+        int(lat * 1e7), int(lon * 1e7), alt,
+        seq, 16, 1, 1, 3, 0, 1,
+    )
+    return _build(MISSION_ITEM, payload, sys_id)
+
+
 def parse_mavlink(data: bytes) -> Optional[dict]:
     if len(data) < 12 or data[0] != 0xFD:
         return None
@@ -120,32 +177,55 @@ def parse_mavlink(data: bytes) -> Optional[dict]:
     if msg_id == GPS_INPUT and len(payload) >= 26:
         lat = struct.unpack_from("<i", payload, 18)[0] / 1e7
         lon = struct.unpack_from("<i", payload, 22)[0] / 1e7
-    return {"seq": seq, "sys_id": sys_id, "msg_id": msg_id,
-            "payload": payload, "checksum_valid": valid, "lat": lat, "lon": lon}
+    return {
+        "seq": seq, "sys_id": sys_id, "msg_id": msg_id,
+        "payload": payload, "checksum_valid": valid, "lat": lat, "lon": lon,
+    }
 
 
 # ── Shared state ──────────────────────────────────────────────────────────────
-drone_state = {"armed": False, "lat": 37.7749, "lon": -122.4194, "alt": 50.0, "mode": 0}
+drone_state = {
+    "armed": False,
+    "lat":   HOME_LAT,
+    "lon":   HOME_LON,
+    "alt":   0.0,
+    "mode":  0,
+}
 
-# Per-client queues — each WS connection gets its own asyncio.Queue
+# Extended telemetry dict
+_telem: dict = {
+    "battery_pct":    100.0,
+    "gps_sats":       12,
+    "heading":        0.0,
+    "groundspeed":    0.0,
+    "flight_phase":   "PREFLIGHT",
+    "geofence_breach": False,
+    "orbit_angle":    0.0,
+    "orbit_start_time": 0.0,
+    "armed_time":     0.0,
+}
+
+# Per-client queues
 client_queues: list[asyncio.Queue] = []
 
-# UDP sockets (shared — created in main())
-_drone_sock:  Optional[_socket.socket] = None   # forward to drone :14550
-_legit_sock:  Optional[_socket.socket] = None   # trusted sender :14552
+# Event history deque (maxlen=500)
+_event_history: deque = deque(maxlen=500)
+
+# UDP sockets
+_drone_sock: Optional[_socket.socket] = None
+_legit_sock: Optional[_socket.socket] = None
 
 # Simulation state
-_sim_task:   Optional[asyncio.Task]   = None
-_sim_mode:   str                      = "stopped"
-_sim_lat:    float = 37.7749
-_sim_lon:    float = -122.4194
+_sim_task: Optional[asyncio.Task]  = None
+_sim_mode: str                     = "stopped"
 
-# The running event loop (set in main, used by UDP thread)
+# The running event loop
 _loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 def _push_event(event: dict) -> None:
-    """Put event into every connected client queue. Safe to call from any thread."""
+    """Put event into every connected client queue and history. Safe from any thread."""
+    _event_history.append(event)
     for q in client_queues:
         try:
             q.put_nowait(event)
@@ -153,7 +233,7 @@ def _push_event(event: dict) -> None:
             pass
 
 
-# ── IDS packet processing (async, always on the event loop) ──────────────────
+# ── IDS packet processing ─────────────────────────────────────────────────────
 async def _process_packet(data: bytes, addr: tuple) -> None:
     pkt = parse_mavlink(data)
     if not pkt or not pkt["checksum_valid"]:
@@ -164,7 +244,7 @@ async def _process_packet(data: bytes, addr: tuple) -> None:
     src     = f"{addr[0]}:{addr[1]}"
 
     # Layer 1: rule engine
-    rule_res  = rule_engine.check(msg_id, payload, addr, drone_state)
+    rule_res  = rule_engine.check(msg_id, payload, addr, drone_state, sys_id=pkt["sys_id"])
     verdict   = rule_res.verdict
     rule_name = rule_res.rule
 
@@ -186,17 +266,30 @@ async def _process_packet(data: bytes, addr: tuple) -> None:
             pass
         _apply_state(msg_id, payload)
 
-    attack_type = (rule_name or "UNKNOWN") if verdict != "ALLOW" else None
+    attack_type    = (rule_name or "UNKNOWN") if verdict != "ALLOW" else None
+    blocked_impact = rule_engine.BLOCKED_IMPACT.get(rule_name, "") if verdict != "ALLOW" else ""
+
+    # Build current drone_state with telem overlay
+    ds_snapshot = dict(drone_state)
+    ds_snapshot.update({
+        "battery_pct":    _telem["battery_pct"],
+        "gps_sats":       _telem["gps_sats"],
+        "heading":        round(_telem["heading"], 1),
+        "groundspeed":    round(_telem["groundspeed"], 1),
+        "flight_phase":   _telem["flight_phase"],
+        "geofence_breach": _telem["geofence_breach"],
+    })
 
     event = {
-        "timestamp":    datetime.now(timezone.utc).isoformat(),
-        "packet_type":  MSG_NAMES.get(msg_id, f"MSG_{msg_id}"),
-        "source":       src,
-        "verdict":      verdict,
-        "threat_score": round(threat_score, 4),
-        "drone_state":  dict(drone_state),
-        "attack_type":  attack_type,
-        "rule":         rule_name,
+        "timestamp":      datetime.now(timezone.utc).isoformat(),
+        "packet_type":    MSG_NAMES.get(msg_id, f"MSG_{msg_id}"),
+        "source":         src,
+        "verdict":        verdict,
+        "threat_score":   round(threat_score, 4),
+        "drone_state":    ds_snapshot,
+        "attack_type":    attack_type,
+        "rule":           rule_name,
+        "blocked_impact": blocked_impact,
     }
 
     lvl = {"ALLOW": logging.DEBUG, "ALERT": logging.WARNING,
@@ -221,10 +314,8 @@ def _apply_state(msg_id: int, payload: bytes) -> None:
         drone_state["alt"] = struct.unpack_from("<f", payload, 26)[0]
 
 
-# ── Thread-based UDP receiver (avoids Windows ProactorEventLoop UDP issues) ──
+# ── Thread-based UDP receiver ─────────────────────────────────────────────────
 def _udp_receiver_thread(loop: asyncio.AbstractEventLoop) -> None:
-    """Blocking UDP receiver in a daemon thread. Submits each packet to the
-    asyncio event loop for processing."""
     sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
     sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
     sock.bind(("0.0.0.0", _IDS_PORT))
@@ -239,8 +330,6 @@ def _udp_receiver_thread(loop: asyncio.AbstractEventLoop) -> None:
         except Exception as e:
             logger.error(f"UDP receive error: {e}")
             break
-
-        # Hand off to the asyncio event loop — thread-safe
         asyncio.run_coroutine_threadsafe(_process_packet(data, addr), loop)
 
 
@@ -257,6 +346,27 @@ async def health():
 @app.get("/api/sim_status")
 async def sim_status():
     return {"mode": _sim_mode, "clients": len(client_queues)}
+
+
+@app.get("/api/telemetry")
+async def get_telemetry():
+    """Return current flight telemetry (excludes internal orbit state fields)."""
+    return {
+        "battery_pct":    _telem["battery_pct"],
+        "gps_sats":       _telem["gps_sats"],
+        "heading":        round(_telem["heading"], 1),
+        "groundspeed":    round(_telem["groundspeed"], 1),
+        "flight_phase":   _telem["flight_phase"],
+        "geofence_breach": _telem["geofence_breach"],
+    }
+
+
+@app.get("/api/events/recent")
+async def get_recent_events(limit: int = 50):
+    """Return last N events from history (newest first)."""
+    limit = max(1, min(limit, 500))
+    items = list(_event_history)
+    return {"events": items[-limit:][::-1], "total": len(items)}
 
 
 class SimRequest(BaseModel):
@@ -280,11 +390,14 @@ async def simulate(req: SimRequest):
         return {"status": "stopped"}
 
     SIM_FNS = {
-        "normal": _sim_normal,
-        "arm":    _sim_arm,
-        "gps":    _sim_gps,
-        "mode":   _sim_mode_chg,
-        "all":    _sim_full,
+        "normal":  _sim_normal,
+        "arm":     _sim_arm,
+        "gps":     _sim_gps,
+        "mode":    _sim_mode_chg,
+        "param":   _sim_param,
+        "mission": _sim_mission,
+        "spoof":   _sim_spoof,
+        "all":     _sim_full,
     }
     if req.action not in SIM_FNS:
         raise HTTPException(400, f"Unknown action: {req.action}")
@@ -328,21 +441,126 @@ def _send_legit(pkt: bytes) -> None:
             pass
 
 
-async def _normal_tick(rng: random.Random) -> None:
-    global _sim_lat, _sim_lon
-    _send_legit(_hb())
-    await asyncio.sleep(0.5)
-    _sim_lat += rng.gauss(0, 4e-6)
-    _sim_lon += rng.gauss(0, 4e-6)
-    _send_legit(_gps(_sim_lat, _sim_lon))
-    await asyncio.sleep(0.5)
+def _send_attack(sock: _socket.socket, pkt: bytes) -> None:
+    try:
+        sock.sendto(pkt, ("127.0.0.1", _IDS_PORT))
+    except Exception:
+        pass
 
 
 async def _sim_normal() -> None:
+    """Realistic phased flight simulation: PREFLIGHT → ARMED → TAKEOFF → CRUISE."""
+    global _telem
     rng = random.Random(int(time.time()))
+    start = time.time()
+    prev_lat = HOME_LAT
+    prev_lon = HOME_LON
+    prev_ts  = start
+
+    _telem["flight_phase"]   = "PREFLIGHT"
+    _telem["orbit_start_time"] = start
+    _telem["armed_time"]     = 0.0
+    _telem["orbit_angle"]    = 0.0
+    _telem["battery_pct"]    = 100.0
+    _telem["geofence_breach"] = False
+
     try:
         while True:
-            await _normal_tick(rng)
+            now = time.time()
+            elapsed = now - start
+            dt = now - prev_ts
+            prev_ts = now
+
+            # ─ PREFLIGHT: T=0–3s ─────────────────────────────────────────────
+            if elapsed < 3.0:
+                _telem["flight_phase"] = "PREFLIGHT"
+                drone_state["armed"] = False
+                drone_state["mode"]  = 0
+                drone_state["alt"]   = 0.0
+                lat, lon = HOME_LAT, HOME_LON
+                _telem["groundspeed"] = 0.0
+                _telem["heading"]     = 0.0
+                _send_legit(_hb(sys_id=1))
+                _send_legit(_gps(lat, lon, alt=0.0))
+                await asyncio.sleep(0.5)
+
+            # ─ ARMED: T=3–8s ─────────────────────────────────────────────────
+            elif elapsed < 8.0:
+                if _telem["flight_phase"] != "ARMED":
+                    _telem["flight_phase"] = "ARMED"
+                    _telem["armed_time"]   = now
+                    drone_state["armed"]   = True
+                    drone_state["mode"]    = 4  # GUIDED
+                    _send_legit(_arm(True, sys_id=1))
+                lat, lon = HOME_LAT, HOME_LON
+                _telem["groundspeed"] = 0.0
+                _send_legit(_hb(sys_id=1))
+                _send_legit(_gps(lat, lon, alt=0.0))
+                await asyncio.sleep(0.5)
+
+            # ─ TAKEOFF: T=8–18s — glide toward orbit entry (angle=0) ────────
+            elif elapsed < 18.0:
+                if _telem["flight_phase"] != "TAKEOFF":
+                    _telem["flight_phase"] = "TAKEOFF"
+                frac = (elapsed - 8.0) / 10.0
+                alt  = frac * 40.0
+                drone_state["alt"] = alt
+                # Interpolate lat/lon toward orbit entry point to avoid GPS_JUMP at CRUISE start
+                orbit_entry_lat = HOME_LAT
+                orbit_entry_lon = HOME_LON + ORBIT_R_LON
+                lat = HOME_LAT + frac * (orbit_entry_lat - HOME_LAT)
+                lon = HOME_LON + frac * (orbit_entry_lon - HOME_LON)
+                _telem["groundspeed"] = frac * 5.0
+                _telem["heading"]     = 90.0  # heading east toward orbit entry
+                _send_legit(_hb(sys_id=1))
+                _send_legit(_gps(lat, lon, alt=alt))
+                await asyncio.sleep(0.5)
+
+            # ─ CRUISE: T=18s+ ────────────────────────────────────────────────
+            else:
+                if _telem["flight_phase"] != "CRUISE":
+                    _telem["flight_phase"] = "CRUISE"
+
+                # Orbit update
+                angle = _telem["orbit_angle"]
+                angle = (angle + ORBIT_OMEGA * dt) % (2 * math.pi)
+                _telem["orbit_angle"] = angle
+
+                lat = HOME_LAT + ORBIT_R_LAT * math.sin(angle)
+                lon = HOME_LON + ORBIT_R_LON * math.cos(angle)
+
+                # Heading from consecutive positions
+                dlat = lat - prev_lat
+                dlon = lon - prev_lon
+                if abs(dlat) > 1e-9 or abs(dlon) > 1e-9:
+                    heading = math.degrees(math.atan2(dlon, dlat)) % 360
+                    _telem["heading"] = heading
+
+                prev_lat = lat
+                prev_lon = lon
+
+                # Groundspeed ~5.0 m/s
+                _telem["groundspeed"] = 5.0 + rng.gauss(0, 0.1)
+
+                # Battery drain 0.08%/s
+                _telem["battery_pct"] = max(0.0, _telem["battery_pct"] - 0.08 * dt)
+
+                # GPS sats
+                if rng.random() < 0.03:
+                    _telem["gps_sats"] = rng.randint(8, 10)
+                else:
+                    _telem["gps_sats"] = 12
+
+                # Geofence check (300m)
+                from rule_engine import haversine as _hav, GEOFENCE_RADIUS_M
+                dist = _hav(lat, lon, HOME_LAT, HOME_LON)
+                _telem["geofence_breach"] = dist > GEOFENCE_RADIUS_M
+
+                drone_state["alt"] = 40.0
+                _send_legit(_hb(sys_id=1))
+                _send_legit(_gps(lat, lon, alt=40.0))
+                await asyncio.sleep(0.5)
+
     except asyncio.CancelledError:
         pass
 
@@ -351,13 +569,18 @@ async def _sim_arm() -> None:
     rng = random.Random(int(time.time()))
     atk = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
     try:
-        for _ in range(8):
-            await _normal_tick(rng)
+        # Run normal flight briefly first
+        normal_task = asyncio.create_task(_sim_normal())
+        await asyncio.sleep(8)
+        normal_task.cancel()
+        try:
+            await normal_task
+        except asyncio.CancelledError:
+            pass
         for _ in range(6):
             atk.sendto(_arm(True, sys_id=99), ("127.0.0.1", _IDS_PORT))
             await asyncio.sleep(0.15)
-        while True:
-            await _normal_tick(rng)
+        await _sim_normal()
     except asyncio.CancelledError:
         pass
     finally:
@@ -365,13 +588,17 @@ async def _sim_arm() -> None:
 
 
 async def _sim_gps() -> None:
-    global _sim_lat, _sim_lon
     rng = random.Random(int(time.time()))
     atk = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
     try:
-        for _ in range(8):
-            await _normal_tick(rng)
-        base_lat, base_lon = _sim_lat, _sim_lon
+        normal_task = asyncio.create_task(_sim_normal())
+        await asyncio.sleep(10)
+        normal_task.cancel()
+        try:
+            await normal_task
+        except asyncio.CancelledError:
+            pass
+        base_lat, base_lon = drone_state["lat"], drone_state["lon"]
         for step in range(20):
             _send_legit(_hb())
             atk.sendto(_gps(
@@ -380,8 +607,7 @@ async def _sim_gps() -> None:
                 sys_id=99,
             ), ("127.0.0.1", _IDS_PORT))
             await asyncio.sleep(0.6)
-        while True:
-            await _normal_tick(rng)
+        await _sim_normal()
     except asyncio.CancelledError:
         pass
     finally:
@@ -389,16 +615,65 @@ async def _sim_gps() -> None:
 
 
 async def _sim_mode_chg() -> None:
-    rng = random.Random(int(time.time()))
     atk = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
     try:
-        for _ in range(8):
-            await _normal_tick(rng)
+        normal_task = asyncio.create_task(_sim_normal())
+        await asyncio.sleep(8)
+        normal_task.cancel()
+        try:
+            await normal_task
+        except asyncio.CancelledError:
+            pass
         for mode in [6, 3, 9, 6]:
             atk.sendto(_mode_change(mode, sys_id=99), ("127.0.0.1", _IDS_PORT))
             await asyncio.sleep(0.4)
+        await _sim_normal()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        atk.close()
+
+
+async def _sim_param() -> None:
+    """Loop: send PARAM_SET attacks every 2s from attack socket."""
+    atk = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    try:
         while True:
-            await _normal_tick(rng)
+            _send_attack(atk, _param_set("FENCE_ACTION",  0.0))
+            await asyncio.sleep(0.1)
+            _send_attack(atk, _param_set("FS_GCS_ENABLE", 0.0))
+            await asyncio.sleep(2.0)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        atk.close()
+
+
+async def _sim_mission() -> None:
+    """Loop: send MISSION_COUNT then MISSION_ITEM (Washington DC) every 3s."""
+    atk = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    try:
+        while True:
+            _send_attack(atk, _mission_count(1))
+            await asyncio.sleep(0.05)
+            _send_attack(atk, _mission_item(0, 38.897, -77.036, 100.0))
+            await asyncio.sleep(3.0)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        atk.close()
+
+
+async def _sim_spoof() -> None:
+    """Loop: send heartbeats cycling sys_id through 40-49 every 0.5s."""
+    atk = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    idx = 0
+    try:
+        while True:
+            spoof_id = 40 + (idx % 10)
+            idx += 1
+            _send_attack(atk, _hb(sys_id=spoof_id))
+            await asyncio.sleep(0.5)
     except asyncio.CancelledError:
         pass
     finally:
@@ -406,23 +681,30 @@ async def _sim_mode_chg() -> None:
 
 
 async def _sim_full() -> None:
-    global _sim_mode, _sim_lat, _sim_lon
-    rng = random.Random(int(time.time()))
+    """Full attack sequence: arm → gps → mode → param → mission → spoof, then loop normal."""
+    global _sim_mode
     atk = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
     try:
+        # Phase: normal flight warm-up
         _sim_mode = "normal"
-        for _ in range(5):
-            await _normal_tick(rng)
+        normal_task = asyncio.create_task(_sim_normal())
+        await asyncio.sleep(10)
+        normal_task.cancel()
+        try:
+            await normal_task
+        except asyncio.CancelledError:
+            pass
 
+        # Phase: arm injection
         _sim_mode = "arm"
         for _ in range(6):
             atk.sendto(_arm(True, sys_id=99), ("127.0.0.1", _IDS_PORT))
             await asyncio.sleep(0.15)
-        for _ in range(6):
-            await _normal_tick(rng)
+        await asyncio.sleep(2)
 
+        # Phase: GPS spoof
         _sim_mode = "gps"
-        base_lat, base_lon = _sim_lat, _sim_lon
+        base_lat, base_lon = drone_state["lat"], drone_state["lon"]
         for step in range(12):
             _send_legit(_hb())
             atk.sendto(_gps(
@@ -432,14 +714,43 @@ async def _sim_full() -> None:
             ), ("127.0.0.1", _IDS_PORT))
             await asyncio.sleep(0.7)
 
+        # Phase: mode change
         _sim_mode = "mode"
         for mode in [6, 3, 9]:
             atk.sendto(_mode_change(mode, sys_id=99), ("127.0.0.1", _IDS_PORT))
             await asyncio.sleep(0.5)
+        await asyncio.sleep(1)
 
+        # Phase: param tamper
+        _sim_mode = "param"
+        for _ in range(4):
+            atk.sendto(_param_set("FENCE_ACTION",  0.0), ("127.0.0.1", _IDS_PORT))
+            await asyncio.sleep(0.1)
+            atk.sendto(_param_set("FS_GCS_ENABLE", 0.0), ("127.0.0.1", _IDS_PORT))
+            await asyncio.sleep(0.1)
+            atk.sendto(_param_set("ARMING_CHECK",  0.0), ("127.0.0.1", _IDS_PORT))
+            await asyncio.sleep(0.3)
+        await asyncio.sleep(1)
+
+        # Phase: mission inject
+        _sim_mode = "mission"
+        for _ in range(3):
+            atk.sendto(_mission_count(1), ("127.0.0.1", _IDS_PORT))
+            await asyncio.sleep(0.05)
+            atk.sendto(_mission_item(0, 38.897, -77.036, 100.0), ("127.0.0.1", _IDS_PORT))
+            await asyncio.sleep(1.0)
+
+        # Phase: heartbeat spoof
+        _sim_mode = "spoof"
+        for i in range(20):
+            atk.sendto(_hb(sys_id=40 + (i % 10)), ("127.0.0.1", _IDS_PORT))
+            await asyncio.sleep(0.2)
+        await asyncio.sleep(1)
+
+        # Return to normal
         _sim_mode = "normal"
-        while True:
-            await _normal_tick(rng)
+        await _sim_normal()
+
     except asyncio.CancelledError:
         pass
     finally:
@@ -461,7 +772,7 @@ async def main(demo: bool = False) -> None:
     # Socket to forward clean packets to drone (14550)
     _drone_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
 
-    # Trusted sender socket (bound to 14552 — registered as trusted by rule engine)
+    # Trusted sender socket (bound to 14552)
     _legit_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
     _legit_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
     try:
@@ -496,7 +807,7 @@ async def main(demo: bool = False) -> None:
             _sim_task = asyncio.create_task(_sim_full())
         asyncio.create_task(_demo())
 
-    # Start FastAPI / uvicorn (blocks until shutdown)
+    # Start FastAPI / uvicorn
     config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="warning", loop="none")
     server = uvicorn.Server(config)
     logger.info("FastAPI WebSocket: ws://0.0.0.0:8000/ws")

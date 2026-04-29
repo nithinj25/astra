@@ -86,4 +86,77 @@ export const RULE_INTEL: Record<string, RuleInfo> = {
       { label: 'Source',      desc: 'Single IP, high-frequency burst' },
     ],
   },
+  PARAM_TAMPER: {
+    title:    'Critical Parameter Tampering',
+    severity: 'CRITICAL',
+    category: 'Configuration Attack',
+    impact:
+      'Adversary sending PARAM_SET to modify flight-critical parameters — disabling geofencing (FENCE_ACTION=0), '
+      + 'GCS failsafe (FS_GCS_ENABLE=0), or arming checks (ARMING_CHECK=0). '
+      + 'Successful modification removes key safety constraints from the autopilot.',
+    recommendation: 'Parameter change blocked. Audit current parameter set against known-good baseline.',
+    mitre: 'ICS T0836 — Modify Parameter',
+    cvss:  9.3,
+    fields: [
+      { label: 'Message ID',      desc: 'PARAM_SET (23)' },
+      { label: 'Target',          desc: 'Autopilot parameter store' },
+      { label: 'Common targets',  desc: 'FENCE_ACTION, FS_GCS_ENABLE, ARMING_CHECK' },
+      { label: 'Source',          desc: 'Unregistered — not in trusted GCS registry' },
+    ],
+  },
+  MISSION_INJECT: {
+    title:    'Hostile Waypoint Injection',
+    severity: 'CRITICAL',
+    category: 'Mission Manipulation',
+    impact:
+      'MISSION_ITEM or MISSION_COUNT received from unregistered source. '
+      + 'Attacker can upload a replacement flight plan directing the drone to a hostile location, '
+      + 'into restricted airspace, or into a physical hazard — without operator knowledge.',
+    recommendation: 'Mission upload blocked. Current mission plan preserved.',
+    mitre: 'ICS T0840 — Network Connection Enumeration',
+    cvss:  9.0,
+    fields: [
+      { label: 'Message ID',   desc: 'MISSION_ITEM (39) / MISSION_COUNT (44)' },
+      { label: 'Waypoint cmd', desc: 'MAV_CMD_NAV_WAYPOINT (16)' },
+      { label: 'Frame',        desc: 'MAV_FRAME_GLOBAL_RELATIVE_ALT (3)' },
+      { label: 'Target',       desc: 'Hostile coordinates outside operational zone' },
+    ],
+  },
+  HEARTBEAT_SPOOF: {
+    title:    'GCS Identity Spoofing',
+    severity: 'HIGH',
+    category: 'Trust Escalation',
+    impact:
+      'Single source IP sending HEARTBEAT packets with multiple system IDs. '
+      + 'Attacker is attempting to register multiple fake GCS identities to gain trusted status, '
+      + 'enabling subsequent unauthorized commands that would be accepted by the IDS.',
+    recommendation: 'Spoofed system IDs blocked from trust registry. Only canonical GCS sys_id=1 accepted.',
+    mitre: 'ICS T0886 — Remote System Discovery',
+    cvss:  7.5,
+    fields: [
+      { label: 'Message ID',    desc: 'HEARTBEAT (0)' },
+      { label: 'Anomaly',       desc: 'Multiple sys_ids from same IP within 30s' },
+      { label: 'Goal',          desc: 'Register fake GCS as trusted source' },
+      { label: 'Window',        desc: '30 second observation window' },
+    ],
+  },
+  GEOFENCE_BREACH: {
+    title:    'Geofence Boundary Violation',
+    severity: 'HIGH',
+    category: 'Spatial Anomaly',
+    impact:
+      'GPS position update places the drone outside the 300m operational geofence. '
+      + 'This may indicate a slow-drift GPS spoofing attack that passed GPS_JUMP detection '
+      + 'by using small incremental position changes to gradually move the drone outside the safe zone.',
+    recommendation:
+      'Alert raised. Consider activating RTL (Return to Launch) and cross-validating with IMU dead-reckoning.',
+    mitre: 'ICS T0856 — Spoof Reporting Message',
+    cvss:  8.0,
+    fields: [
+      { label: 'Geofence',    desc: '300m radius from home position' },
+      { label: 'Home',        desc: '37.7749°N, 122.4194°W' },
+      { label: 'Detection',   desc: 'Haversine distance from home exceeds limit' },
+      { label: 'Attack type', desc: 'Slow-drift GPS spoofing (sub-50m increments)' },
+    ],
+  },
 }

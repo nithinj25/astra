@@ -1,31 +1,51 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
-import PacketFeed    from './components/PacketFeed'
-import AttackMap     from './components/AttackMap'
-import ThreatGraph   from './components/ThreatGraph'
-import ThreatIntel   from './components/ThreatIntel'
-import ProtocolChart from './components/ProtocolChart'
-import SourceTracker from './components/SourceTracker'
-import EventDrawer   from './components/EventDrawer'
+import PacketFeed        from './components/PacketFeed'
+import AttackMap         from './components/AttackMap'
+import ThreatGraph       from './components/ThreatGraph'
+import ThreatIntel       from './components/ThreatIntel'
+import ProtocolChart     from './components/ProtocolChart'
+import SourceTracker     from './components/SourceTracker'
+import EventDrawer       from './components/EventDrawer'
+import FlightInstruments from './components/FlightInstruments'
+import AttackTimeline    from './components/AttackTimeline'
+import AlertQueue        from './components/AlertQueue'
+import { eventId }       from './components/AlertQueue'
 
 export interface IDSEvent {
-  timestamp:    string
-  packet_type:  string
-  source:       string
-  verdict:      'ALLOW' | 'ALERT' | 'BLOCK'
-  threat_score: number
-  drone_state:  { armed: boolean; lat: number; lon: number; alt: number; mode: number }
-  attack_type:  string | null
-  rule:         string
+  timestamp:      string
+  packet_type:    string
+  source:         string
+  verdict:        'ALLOW' | 'ALERT' | 'BLOCK'
+  threat_score:   number
+  drone_state:    {
+    armed:           boolean
+    lat:             number
+    lon:             number
+    alt:             number
+    mode:            number
+    battery_pct:     number
+    gps_sats:        number
+    heading:         number
+    groundspeed:     number
+    flight_phase:    string
+    geofence_breach: boolean
+  }
+  attack_type:    string | null
+  rule:           string
+  blocked_impact: string
 }
 
 // ── Sim actions ────────────────────────────────────────────────────────────────
 const SIM_ACTIONS = [
-  { id: 'normal', label: 'Normal Flight', variant: 'safe'   },
-  { id: 'arm',    label: 'ARM Inject',    variant: 'danger' },
-  { id: 'gps',    label: 'GPS Spoof',     variant: 'warn'   },
-  { id: 'mode',   label: 'Mode Change',   variant: 'info'   },
-  { id: 'all',    label: 'Full Attack',   variant: 'danger' },
-  { id: 'stop',   label: 'Stop',          variant: 'muted'  },
+  { id: 'normal',  label: 'Normal Flight', variant: 'safe'   },
+  { id: 'arm',     label: 'ARM Inject',    variant: 'danger' },
+  { id: 'gps',     label: 'GPS Spoof',     variant: 'warn'   },
+  { id: 'mode',    label: 'Mode Change',   variant: 'info'   },
+  { id: 'param',   label: 'Param Tamper',  variant: 'danger' },
+  { id: 'mission', label: 'Mission Inject',variant: 'danger' },
+  { id: 'spoof',   label: 'HB Spoof',      variant: 'warn'   },
+  { id: 'all',     label: 'Full Attack',   variant: 'danger' },
+  { id: 'stop',    label: 'Stop',          variant: 'muted'  },
 ] as const
 
 const MODE_NAMES: Record<number, string> = {
@@ -51,16 +71,24 @@ const THREAT_BADGE: Record<ThreatLevel, string> = {
 }
 
 // ── Tab types ──────────────────────────────────────────────────────────────────
-type Tab = 'intel' | 'protocol' | 'sources'
+type Tab = 'intel' | 'protocol' | 'sources' | 'timeline' | 'alerts'
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'intel',    label: 'Threat Intel'   },
   { id: 'protocol', label: 'Protocol Stats' },
   { id: 'sources',  label: 'Source Tracker' },
+  { id: 'timeline', label: 'Timeline'       },
+  { id: 'alerts',   label: 'Alert Queue'    },
 ]
 
 const MAX_EVENTS = 200
 const MAX_SCORES = 120
+
+const DEFAULT_DRONE_STATE: IDSEvent['drone_state'] = {
+  armed: false, lat: 37.7749, lon: -122.4194, alt: 0, mode: 0,
+  battery_pct: 100, gps_sats: 12, heading: 0, groundspeed: 0,
+  flight_phase: 'PREFLIGHT', geofence_breach: false,
+}
 
 // ── Sim button style ───────────────────────────────────────────────────────────
 function simCls(variant: string, active: boolean, busy: boolean) {
@@ -88,20 +116,18 @@ function fmtDuration(s: number): string {
 }
 
 export default function App() {
-  const [events,        setEvents]        = useState<IDSEvent[]>([])
-  const [scores,        setScores]        = useState<{ t: number; v: number }[]>([])
-  const [connected,     setConnected]     = useState(false)
-  const [flashing,      setFlashing]      = useState(false)
-  const [simMode,       setSimMode]       = useState<string>('normal')
-  const [simLoading,    setSimLoading]    = useState(false)
-  const [pktRate,       setPktRate]       = useState(0)
-  const [evtPerMin,     setEvtPerMin]     = useState(0)
-  const [sessionSecs,   setSessionSecs]   = useState(0)
-  const [activeTab,     setActiveTab]     = useState<Tab>('intel')
-  const [selectedEvent, setSelectedEvent] = useState<IDSEvent | null>(null)
-  const [droneState,    setDroneState]    = useState<IDSEvent['drone_state']>({
-    armed: false, lat: 37.7749, lon: -122.4194, alt: 50, mode: 0,
-  })
+  const [events,          setEvents]          = useState<IDSEvent[]>([])
+  const [scores,          setScores]          = useState<{ t: number; v: number }[]>([])
+  const [connected,       setConnected]       = useState(false)
+  const [flashing,        setFlashing]        = useState(false)
+  const [simMode,         setSimMode]         = useState<string>('normal')
+  const [simLoading,      setSimLoading]      = useState(false)
+  const [pktRate,         setPktRate]         = useState(0)
+  const [sessionSecs,     setSessionSecs]     = useState(0)
+  const [activeTab,       setActiveTab]       = useState<Tab>('intel')
+  const [selectedEvent,   setSelectedEvent]   = useState<IDSEvent | null>(null)
+  const [droneState,      setDroneState]      = useState<IDSEvent['drone_state']>(DEFAULT_DRONE_STATE)
+  const [acknowledgedIds, setAcknowledgedIds] = useState<Set<string>>(new Set())
 
   const wsRef        = useRef<WebSocket | null>(null)
   const flashRef     = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -123,15 +149,12 @@ export default function App() {
     return () => clearInterval(iv)
   }, [])
 
-  // ── Packet rate + events/min ──────────────────────────────────────────────
+  // ── Packet rate ────────────────────────────────────────────────────────────
   useEffect(() => {
     const iv = setInterval(() => {
       const now = Date.now()
       rateBuf.current = rateBuf.current.filter(t => now - t < 5000)
       setPktRate(rateBuf.current.length / 5)
-
-      const lastMin = rateBuf.current.filter(t => now - t < 60_000).length
-      setEvtPerMin(lastMin)
     }, 1000)
     return () => clearInterval(iv)
   }, [])
@@ -198,6 +221,12 @@ export default function App() {
     return 'SECURE'
   }, [events])
 
+  // ── Acknowledge ────────────────────────────────────────────────────────────
+  const onAcknowledge = useCallback((ev: IDSEvent) => {
+    const id = eventId(ev)
+    setAcknowledgedIds(prev => new Set([...prev, id]))
+  }, [])
+
   // ── Simulation ─────────────────────────────────────────────────────────────
   const startSim = useCallback(async (action: string) => {
     setSimLoading(true)
@@ -248,12 +277,12 @@ export default function App() {
 
   // ── Stat cards data ────────────────────────────────────────────────────────
   const statCards = [
-    { label: 'Intercepted',    value: stats.total,                    unit: 'total packets',       color: 'text-ds-t1'   },
-    { label: 'Blocked',        value: stats.blocked,                  unit: stats.pct(stats.blocked) + ' of traffic',   color: 'text-ds-red'   },
-    { label: 'Alerts',         value: stats.alerted,                  unit: stats.pct(stats.alerted) + ' of traffic',  color: 'text-ds-amber' },
-    { label: 'Threat Score',   value: stats.score.toFixed(3),         unit: 'Isolation Forest ML', color: stats.score > 0.45 ? 'text-ds-red' : stats.score > 0.15 ? 'text-ds-amber' : 'text-ds-green' },
-    { label: 'Pkt / s',        value: pktRate.toFixed(1),             unit: '5 s rolling window',  color: pktRate > 18 ? 'text-ds-red' : 'text-ds-cyan' },
-    { label: 'Events / min',   value: evtPerMin,                      unit: '60 s window',         color: 'text-ds-t2'  },
+    { label: 'Intercepted',  value: stats.total,               unit: 'total packets',                    color: 'text-ds-t1'   },
+    { label: 'Blocked',      value: stats.blocked,             unit: stats.pct(stats.blocked) + ' of traffic', color: 'text-ds-red'   },
+    { label: 'Alerts',       value: stats.alerted,             unit: stats.pct(stats.alerted) + ' of traffic', color: 'text-ds-amber' },
+    { label: 'Threat Score', value: stats.score.toFixed(3),    unit: 'Isolation Forest ML',               color: stats.score > 0.45 ? 'text-ds-red' : stats.score > 0.15 ? 'text-ds-amber' : 'text-ds-green' },
+    { label: 'Pkt / s',      value: pktRate.toFixed(1),        unit: '5 s rolling window',               color: pktRate > 18 ? 'text-ds-red' : 'text-ds-cyan' },
+    { label: 'Prevented',    value: stats.blocked,             unit: 'attacks blocked',                   color: stats.blocked > 0 ? 'text-ds-red' : 'text-ds-t2' },
   ]
 
   return (
@@ -272,7 +301,7 @@ export default function App() {
                 : 'bg-ds-red animate-pulse-fast'
             }`} />
             <span className="text-sm font-semibold text-ds-t1 font-mono tracking-wide">DroneShield</span>
-            <span className="text-[11px] text-ds-t3 font-mono">IDS v1.0</span>
+            <span className="text-[11px] text-ds-t3 font-mono">IDS v2.0</span>
           </div>
 
           <div className="w-px h-4 bg-ds-border" />
@@ -314,6 +343,9 @@ export default function App() {
           </span>
         </div>
       </header>
+
+      {/* ── Flight Instruments ────────────────────────────────────────────────── */}
+      <FlightInstruments droneState={droneState} connected={connected} />
 
       {/* ── Stat Cards ────────────────────────────────────────────────────────── */}
       <div className="grid grid-cols-6 gap-px bg-ds-border border-b border-ds-border shrink-0">
@@ -383,7 +415,7 @@ export default function App() {
               <AttackMap events={events} droneState={droneState} />
             </div>
 
-            {/* Tabbed panel: Intel / Protocol / Sources */}
+            {/* Tabbed panel */}
             <div className="flex-1 bg-ds-panel flex flex-col overflow-hidden">
 
               {/* Tab bar */}
@@ -392,7 +424,7 @@ export default function App() {
                   <button
                     key={tab.id}
                     onClick={() => setActiveTab(tab.id)}
-                    className={`px-4 py-1.5 text-[10px] font-medium border-r border-ds-border transition-colors select-none cursor-pointer
+                    className={`px-3 py-1.5 text-[10px] font-medium border-r border-ds-border transition-colors select-none cursor-pointer
                                ${activeTab === tab.id
                                  ? 'text-ds-t1 bg-ds-panel2 border-b-2 border-b-ds-blue'
                                  : 'text-ds-t3 hover:text-ds-t2 hover:bg-ds-panel2/50'}`}
@@ -407,6 +439,19 @@ export default function App() {
                 {activeTab === 'intel'    && <ThreatIntel   events={events} />}
                 {activeTab === 'protocol' && <ProtocolChart events={events} />}
                 {activeTab === 'sources'  && <SourceTracker events={events} />}
+                {activeTab === 'timeline' && (
+                  <AttackTimeline
+                    events={events}
+                    onSelect={ev => setSelectedEvent(prev => prev === ev ? null : ev)}
+                  />
+                )}
+                {activeTab === 'alerts'   && (
+                  <AlertQueue
+                    events={events}
+                    acknowledgedIds={acknowledgedIds}
+                    onAcknowledge={onAcknowledge}
+                  />
+                )}
               </div>
 
             </div>
@@ -415,7 +460,7 @@ export default function App() {
       </div>
 
       {/* ── Command Bar ───────────────────────────────────────────────────────── */}
-      <div className="flex items-center gap-2 px-5 py-2 border-t border-ds-border bg-ds-panel shrink-0">
+      <div className="flex items-center gap-2 px-5 py-2 border-t border-ds-border bg-ds-panel shrink-0 flex-wrap">
 
         {/* Sim label */}
         <span className="text-[9px] text-ds-t3 uppercase tracking-widest shrink-0 mr-1 font-mono">
