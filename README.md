@@ -194,8 +194,22 @@ Clicking a row shows:
 ### Threat Score Timeline
 Rolling 60-second Recharts plot of the Isolation Forest anomaly score. A threshold line separates nominal from anomalous behavior.
 
+### Flight Instruments Strip
+Horizontal HUD bar below the header showing live flight telemetry:
+- **Flight phase** — color-coded pill: PREFLIGHT / ARMED / TAKEOFF / CRUISE
+- **Battery** — 8-segment bar with percentage
+- **GPS** — satellite count + fix quality (LOCK / WEAK / NO FIX)
+- **Groundspeed** — m/s
+- **Heading** — degrees + cardinal direction (N/NE/E/…)
+- **Geofence** — NOMINAL (green) or BREACH (red) relative to 300m home perimeter
+
 ### Drone Position Map
-Live SVG plot of GPS position history. Spoofed coordinates appear as red dots; the legitimate flight path is green.
+Live SVG plot of GPS position history within a 300m geofence circle.
+- Green line — legitimate flight path
+- Red dots — GPS spoof injection points
+- Cyan arrow — drone heading indicator
+- Pulsing red ring — active geofence breach animation
+- Battery/speed overlay in the corner
 
 ### Tab Panel (bottom right)
 
@@ -204,6 +218,8 @@ Live SVG plot of GPS position history. Spoofed coordinates appear as red dots; t
 | **Threat Intel** | Active attack classification with CVSS score, impact description, MITRE ATT&CK for ICS reference, and IDS response |
 | **Protocol Stats** | Stacked bar chart of MAVLink message types broken down by Pass / Alert / Block |
 | **Source Tracker** | Per-IP table: total packets, blocked, alerted, risk %, last seen |
+| **Timeline** | Forensic SVG attack timeline — 120s window, attack clusters highlighted, click to inspect |
+| **Alert Queue** | SOC acknowledge workflow — Pending / Investigated split with one-click acknowledgment |
 
 ### Stat Cards
 
@@ -214,7 +230,7 @@ Live SVG plot of GPS position history. Spoofed coordinates appear as red dots; t
 | Alerts | Count + percentage flagged |
 | Threat Score | Current Isolation Forest output |
 | Pkt/s | 5-second rolling packet rate |
-| Events/min | 60-second rolling event rate |
+| Prevented | Total attacks blocked this session |
 
 ### Export
 - **Export JSON** — full event log with all fields as a timestamped `.json` file
@@ -226,22 +242,28 @@ Live SVG plot of GPS position history. Spoofed coordinates appear as red dots; t
 
 Use the command bar at the bottom of the dashboard:
 
-| Button | What happens |
-|--------|-------------|
-| **Normal Flight** | Clean HEARTBEAT + GPS_INPUT loop |
-| **ARM Inject** | Sends unauthorized motor arm command → `UNTRUSTED_ARM` |
-| **GPS Spoof** | Injects forged position with >50 m jump → `GPS_JUMP` |
-| **Mode Change** | Sends SET_MODE from untrusted source → `UNEXPECTED_MODE_CHANGE` |
-| **Full Attack** | All three attacks simultaneously |
+| Button | What it simulates | Rule triggered |
+|--------|-------------------|----------------|
+| **Normal Flight** | Orbital cruise: PREFLIGHT → ARMED → TAKEOFF → CRUISE | — |
+| **ARM Inject** | Unauthorized motor arm from rogue GCS port | `UNTRUSTED_ARM` |
+| **GPS Spoof** | Forged position with >50 m jump | `GPS_JUMP` |
+| **Mode Change** | SET_MODE from untrusted source | `UNEXPECTED_MODE_CHANGE` |
+| **Param Tamper** | PARAM_SET disabling FENCE_ACTION and FS_GCS_ENABLE | `PARAM_TAMPER` |
+| **Mission Inject** | Hostile waypoint upload (Washington DC target) | `MISSION_INJECT` |
+| **HB Spoof** | Heartbeats cycling 10 fake sys_ids from same IP | `HEARTBEAT_SPOOF` |
+| **Full Attack** | Full sequence: all 6 attack types in succession | all rules |
 | **Stop** | Stops all attacks |
 
 Or run the attacker directly from a terminal:
 
 ```bash
-python attacker/attacker.py --attack arm    # ARM injection
-python attacker/attacker.py --attack gps    # GPS spoofing
-python attacker/attacker.py --attack mode   # Mode hijacking
-python attacker/attacker.py --attack all    # All attacks
+python attacker/attacker.py --attack arm      # ARM injection
+python attacker/attacker.py --attack gps      # GPS spoofing
+python attacker/attacker.py --attack mode     # Mode hijacking
+python attacker/attacker.py --attack param    # Parameter tampering
+python attacker/attacker.py --attack mission  # Mission injection
+python attacker/attacker.py --attack spoof    # Heartbeat spoofing
+python attacker/attacker.py --attack all      # All attacks
 ```
 
 ---
@@ -272,6 +294,42 @@ python attacker/attacker.py --attack all    # All attacks
 `SET_MODE` from a source not in the trusted registry. Attacker can force `RTL`, `LAND`, or `GUIDED` — redirecting the flight path or injecting waypoints covertly.
 
 **Detection:** Mode changes only accepted from registered trusted sources.
+
+---
+
+### PARAM_TAMPER — CRITICAL (CVSSv3 9.3)
+**MITRE ICS T0836 — Modify Parameter**
+
+`PARAM_SET` from an unregistered source targeting flight-critical parameters: `FENCE_ACTION=0` (disables geofencing), `FS_GCS_ENABLE=0` (disables GCS failsafe), `ARMING_CHECK=0` (disables arming checks). Successful modification removes safety constraints silently.
+
+**Detection:** Any PARAM_SET from a source not in the trusted registry is blocked.
+
+---
+
+### MISSION_INJECT — CRITICAL (CVSSv3 9.0)
+**MITRE ICS T0840 — Network Connection Enumeration**
+
+`MISSION_COUNT` + `MISSION_ITEM` from an unregistered source. Attacker uploads a replacement flight plan directing the drone to hostile coordinates (demonstrated: Washington DC) without operator knowledge.
+
+**Detection:** Mission uploads only accepted from trusted GCS. Current mission plan preserved on block.
+
+---
+
+### HEARTBEAT_SPOOF — HIGH (CVSSv3 7.5)
+**MITRE ICS T0886 — Remote System Discovery**
+
+A single source IP sends `HEARTBEAT` packets cycling through multiple system IDs within a 30-second window. The goal is to register multiple fake GCS identities in the IDS trust registry, enabling subsequent unauthorized commands.
+
+**Detection:** More than one unique sys_id from the same IP within 30 seconds → ALERT.
+
+---
+
+### GEOFENCE_BREACH — HIGH (CVSSv3 8.0)
+**MITRE ICS T0856 — Spoof Reporting Message**
+
+GPS position update places the drone beyond the 300m operational geofence. This is the signature of slow-drift GPS spoofing — incrementally shifting position by <50m per tick to evade GPS_JUMP detection, gradually relocating the drone outside safe airspace.
+
+**Detection:** Haversine distance from home position (37.7749°N, 122.4194°W) exceeds 300m. ALERT raised; RTL recommended.
 
 ---
 
