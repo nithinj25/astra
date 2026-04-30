@@ -9,6 +9,7 @@ import EventDrawer       from './components/EventDrawer'
 import FlightInstruments from './components/FlightInstruments'
 import AttackTimeline    from './components/AttackTimeline'
 import AlertQueue        from './components/AlertQueue'
+import AttackToast       from './components/AttackToast'
 import { eventId }       from './components/AlertQueue'
 
 export interface IDSEvent {
@@ -47,6 +48,8 @@ const SIM_ACTIONS = [
   { id: 'all',     label: 'Full Attack',   variant: 'danger' },
   { id: 'stop',    label: 'Stop',          variant: 'muted'  },
 ] as const
+
+const DEMO_ACTION = { id: 'demo', label: '▶  DEMO', variant: 'demo' } as const
 
 const MODE_NAMES: Record<number, string> = {
   0: 'STAB', 3: 'AUTO', 4: 'GUIDED', 6: 'RTL', 9: 'LAND',
@@ -101,6 +104,7 @@ function simCls(variant: string, active: boolean, busy: boolean) {
     warn:   { b: 'border-ds-amber/40',  on: 'bg-amber-950/60 text-ds-amber ring-1 ring-ds-amber/40',  off: 'text-ds-amber/50  hover:text-ds-amber/80'  },
     info:   { b: 'border-ds-blue/40',   on: 'bg-blue-950/60  text-ds-blue  ring-1 ring-ds-blue/40',   off: 'text-ds-blue/50   hover:text-ds-blue/80'   },
     muted:  { b: 'border-ds-t3/30',     on: 'bg-ds-panel2    text-ds-t1    ring-1 ring-ds-t3/30',     off: 'text-ds-t3        hover:text-ds-t2'        },
+    demo:   { b: 'border-ds-cyan/60',   on: 'bg-cyan-950/70  text-ds-cyan  ring-1 ring-ds-cyan/60',   off: 'text-ds-cyan/70   hover:text-ds-cyan'      },
   }
   const e = M[variant] ?? M.muted
   return `${base} ${cur} ${e.b} ${active ? e.on : e.off}`
@@ -287,6 +291,7 @@ export default function App() {
 
   return (
     <div className={`h-screen flex flex-col bg-ds-bg ${flashing ? 'flash-attack' : ''}`}>
+      <AttackToast events={events} />
 
       {/* ── Header ──────────────────────────────────────────────────────────── */}
       <header className="flex items-center justify-between px-5 py-2 bg-ds-panel border-b border-ds-border shrink-0">
@@ -462,9 +467,20 @@ export default function App() {
       {/* ── Command Bar ───────────────────────────────────────────────────────── */}
       <div className="flex items-center gap-2 px-5 py-2 border-t border-ds-border bg-ds-panel shrink-0 flex-wrap">
 
+        {/* Demo button — prominent, first in bar */}
+        <button
+          disabled={simLoading}
+          onClick={() => startSim(DEMO_ACTION.id)}
+          className={`${simCls(DEMO_ACTION.variant, simMode === DEMO_ACTION.id, simLoading)} px-4 text-[12px] font-semibold`}
+        >
+          {DEMO_ACTION.label}
+        </button>
+
+        <div className="w-px h-4 bg-ds-border mx-1" />
+
         {/* Sim label */}
         <span className="text-[9px] text-ds-t3 uppercase tracking-widest shrink-0 mr-1 font-mono">
-          Sim
+          Manual
         </span>
 
         {/* Sim buttons */}

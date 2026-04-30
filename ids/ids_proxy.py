@@ -397,6 +397,7 @@ async def simulate(req: SimRequest):
         "param":   _sim_param,
         "mission": _sim_mission,
         "spoof":   _sim_spoof,
+        "demo":    _sim_demo,
         "all":     _sim_full,
     }
     if req.action not in SIM_FNS:
@@ -674,6 +675,84 @@ async def _sim_spoof() -> None:
             idx += 1
             _send_attack(atk, _hb(sys_id=spoof_id))
             await asyncio.sleep(0.5)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        atk.close()
+
+
+async def _sim_demo() -> None:
+    """
+    Judge-friendly auto-demo: runs each attack type once in sequence with clear
+    pauses between so the dashboard reacts visibly. Loops indefinitely.
+    """
+    global _sim_mode
+    atk = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    try:
+        while True:
+            # ── warm-up: normal flight ────────────────────────────────────────
+            _sim_mode = "normal"
+            normal = asyncio.create_task(_sim_normal())
+            await asyncio.sleep(14)       # let CRUISE establish
+            normal.cancel()
+            try:    await normal
+            except asyncio.CancelledError: pass
+
+            # ── 1: ARM injection ─────────────────────────────────────────────
+            _sim_mode = "arm"
+            for _ in range(5):
+                atk.sendto(_arm(True, sys_id=99), ("127.0.0.1", _IDS_PORT))
+                await asyncio.sleep(0.18)
+            await asyncio.sleep(9)        # pause so toast is readable
+
+            # ── 2: GPS spoofing ──────────────────────────────────────────────
+            _sim_mode = "gps"
+            base_lat = drone_state.get("lat", HOME_LAT)
+            base_lon = drone_state.get("lon", HOME_LON)
+            for step in range(8):
+                _send_legit(_hb())
+                atk.sendto(_gps(
+                    base_lat + (step + 1) * 0.001,
+                    base_lon + (step + 1) * 0.0005,
+                    sys_id=99,
+                ), ("127.0.0.1", _IDS_PORT))
+                await asyncio.sleep(0.5)
+            await asyncio.sleep(9)
+
+            # ── 3: mode hijacking ────────────────────────────────────────────
+            _sim_mode = "mode"
+            for mode in [6, 3, 9, 6]:
+                atk.sendto(_mode_change(mode, sys_id=99), ("127.0.0.1", _IDS_PORT))
+                await asyncio.sleep(0.35)
+            await asyncio.sleep(9)
+
+            # ── 4: parameter tampering ───────────────────────────────────────
+            _sim_mode = "param"
+            for _ in range(2):
+                atk.sendto(_param_set("FENCE_ACTION",  0.0), ("127.0.0.1", _IDS_PORT))
+                await asyncio.sleep(0.08)
+                atk.sendto(_param_set("FS_GCS_ENABLE", 0.0), ("127.0.0.1", _IDS_PORT))
+                await asyncio.sleep(0.08)
+                atk.sendto(_param_set("ARMING_CHECK",  0.0), ("127.0.0.1", _IDS_PORT))
+                await asyncio.sleep(1.2)
+            await asyncio.sleep(9)
+
+            # ── 5: mission injection ─────────────────────────────────────────
+            _sim_mode = "mission"
+            for _ in range(2):
+                atk.sendto(_mission_count(1), ("127.0.0.1", _IDS_PORT))
+                await asyncio.sleep(0.06)
+                atk.sendto(_mission_item(0, 38.897, -77.036, 100.0), ("127.0.0.1", _IDS_PORT))
+                await asyncio.sleep(1.5)
+            await asyncio.sleep(9)
+
+            # ── 6: heartbeat spoofing ────────────────────────────────────────
+            _sim_mode = "spoof"
+            for i in range(18):
+                atk.sendto(_hb(sys_id=40 + (i % 10)), ("127.0.0.1", _IDS_PORT))
+                await asyncio.sleep(0.28)
+            await asyncio.sleep(9)
+
     except asyncio.CancelledError:
         pass
     finally:
