@@ -8,6 +8,12 @@ services:
       - "8000:8000"     # WebSocket + REST API
       - "14550:14550/udp"
       - "14551:14551/udp"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
     restart: unless-stopped
 
   frontend:
@@ -16,8 +22,7 @@ services:
       dockerfile: Dockerfile.frontend
     ports:
       - "5173:5173"
-    environment:
-      - API_HOST=ids    # proxy to the ids service, not localhost
     depends_on:
-      - ids
+      ids:
+        condition: service_healthy
     restart: unless-stopped

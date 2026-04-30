@@ -87,6 +87,12 @@ const TABS: { id: Tab; label: string }[] = [
 const MAX_EVENTS = 200
 const MAX_SCORES = 120
 
+// IDS is always on port 8000 on the same host — works for Docker (port exposed)
+// and native dev. No Vite proxy needed.
+const IDS_HOST = `${window.location.hostname}:8000`
+const WS_URL   = `ws://${IDS_HOST}/ws`
+const API_BASE  = `http://${IDS_HOST}`
+
 const DEFAULT_DRONE_STATE: IDSEvent['drone_state'] = {
   armed: false, lat: 37.7749, lon: -122.4194, alt: 0, mode: 0,
   battery_pct: 100, gps_sats: 12, heading: 0, groundspeed: 0,
@@ -166,7 +172,7 @@ export default function App() {
   // ── WebSocket ──────────────────────────────────────────────────────────────
   const connect = useCallback(() => {
     if (wsRef.current && wsRef.current.readyState < 2) return
-    const ws = new WebSocket('ws://localhost:8000/ws')
+    const ws = new WebSocket(WS_URL)
     wsRef.current = ws
 
     ws.onopen  = () => setConnected(true)
@@ -235,7 +241,7 @@ export default function App() {
   const startSim = useCallback(async (action: string) => {
     setSimLoading(true)
     try {
-      const res = await fetch('/api/simulate', {
+      const res = await fetch(`${API_BASE}/api/simulate`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ action }),
