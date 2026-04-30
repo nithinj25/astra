@@ -566,18 +566,23 @@ async def _sim_normal() -> None:
         pass
 
 
-async def _sim_arm() -> None:
-    rng = random.Random(int(time.time()))
-    atk = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
-    try:
-        # Run normal flight briefly first
-        normal_task = asyncio.create_task(_sim_normal())
-        await asyncio.sleep(8)
-        normal_task.cancel()
+async def _cancel_task(t: asyncio.Task) -> None:
+    """Cancel a task and wait for it to finish cleanly."""
+    if t and not t.done():
+        t.cancel()
         try:
-            await normal_task
-        except asyncio.CancelledError:
+            await t
+        except (asyncio.CancelledError, Exception):
             pass
+
+
+async def _sim_arm() -> None:
+    atk         = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    normal_task = asyncio.create_task(_sim_normal())
+    try:
+        await asyncio.sleep(8)
+        await _cancel_task(normal_task)
+        normal_task = None
         for _ in range(6):
             atk.sendto(_arm(True, sys_id=99), ("127.0.0.1", _IDS_PORT))
             await asyncio.sleep(0.15)
@@ -585,20 +590,18 @@ async def _sim_arm() -> None:
     except asyncio.CancelledError:
         pass
     finally:
+        if normal_task is not None:
+            await _cancel_task(normal_task)
         atk.close()
 
 
 async def _sim_gps() -> None:
-    rng = random.Random(int(time.time()))
-    atk = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    atk         = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    normal_task = asyncio.create_task(_sim_normal())
     try:
-        normal_task = asyncio.create_task(_sim_normal())
         await asyncio.sleep(10)
-        normal_task.cancel()
-        try:
-            await normal_task
-        except asyncio.CancelledError:
-            pass
+        await _cancel_task(normal_task)
+        normal_task = None
         base_lat, base_lon = drone_state["lat"], drone_state["lon"]
         for step in range(20):
             _send_legit(_hb())
@@ -612,19 +615,18 @@ async def _sim_gps() -> None:
     except asyncio.CancelledError:
         pass
     finally:
+        if normal_task is not None:
+            await _cancel_task(normal_task)
         atk.close()
 
 
 async def _sim_mode_chg() -> None:
-    atk = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    atk         = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    normal_task = asyncio.create_task(_sim_normal())
     try:
-        normal_task = asyncio.create_task(_sim_normal())
         await asyncio.sleep(8)
-        normal_task.cancel()
-        try:
-            await normal_task
-        except asyncio.CancelledError:
-            pass
+        await _cancel_task(normal_task)
+        normal_task = None
         for mode in [6, 3, 9, 6]:
             atk.sendto(_mode_change(mode, sys_id=99), ("127.0.0.1", _IDS_PORT))
             await asyncio.sleep(0.4)
@@ -632,6 +634,8 @@ async def _sim_mode_chg() -> None:
     except asyncio.CancelledError:
         pass
     finally:
+        if normal_task is not None:
+            await _cancel_task(normal_task)
         atk.close()
 
 
@@ -687,16 +691,16 @@ async def _sim_demo() -> None:
     pauses between so the dashboard reacts visibly. Loops indefinitely.
     """
     global _sim_mode
-    atk = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    atk    = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    normal: asyncio.Task | None = None
     try:
         while True:
             # ── warm-up: normal flight ────────────────────────────────────────
             _sim_mode = "normal"
             normal = asyncio.create_task(_sim_normal())
             await asyncio.sleep(14)       # let CRUISE establish
-            normal.cancel()
-            try:    await normal
-            except asyncio.CancelledError: pass
+            await _cancel_task(normal)
+            normal = None
 
             # ── 1: ARM injection ─────────────────────────────────────────────
             _sim_mode = "arm"
@@ -756,23 +760,23 @@ async def _sim_demo() -> None:
     except asyncio.CancelledError:
         pass
     finally:
+        if normal is not None:
+            await _cancel_task(normal)
         atk.close()
 
 
 async def _sim_full() -> None:
     """Full attack sequence: arm → gps → mode → param → mission → spoof, then loop normal."""
     global _sim_mode
-    atk = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    atk         = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    normal_task: asyncio.Task | None = None
     try:
         # Phase: normal flight warm-up
-        _sim_mode = "normal"
+        _sim_mode   = "normal"
         normal_task = asyncio.create_task(_sim_normal())
         await asyncio.sleep(10)
-        normal_task.cancel()
-        try:
-            await normal_task
-        except asyncio.CancelledError:
-            pass
+        await _cancel_task(normal_task)
+        normal_task = None
 
         # Phase: arm injection
         _sim_mode = "arm"
@@ -833,6 +837,8 @@ async def _sim_full() -> None:
     except asyncio.CancelledError:
         pass
     finally:
+        if normal_task is not None:
+            await _cancel_task(normal_task)
         atk.close()
 
 
