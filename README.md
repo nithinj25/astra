@@ -77,10 +77,30 @@ The entire MAVLink v2 parser is implemented by hand — no `pymavlink`, no exter
 
 ## Quick Start
 
+### Option A — Docker (recommended, works on any OS)
+
+> Requires [Docker Desktop](https://www.docker.com/products/docker-desktop/)
+
 ```bash
-# 1 — Clone
 git clone https://github.com/nithinj25/astra.git
-cd astra
+cd astra/droneshield
+docker compose up --build
+```
+
+Open **http://localhost:5173**. The first build takes ~2 minutes (Python deps + ML model training). After that, `docker compose up` starts instantly.
+
+```bash
+# Stop everything
+docker compose down
+```
+
+---
+
+### Option B — Native (no Docker)
+
+```bash
+git clone https://github.com/nithinj25/astra.git
+cd astra/droneshield
 ```
 
 **macOS / Linux**

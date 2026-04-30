@@ -1,0 +1,23 @@
+services:
+
+  ids:
+    build:
+      context: .
+      dockerfile: Dockerfile.ids
+    ports:
+      - "8000:8000"     # WebSocket + REST API
+      - "14550:14550/udp"
+      - "14551:14551/udp"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    ports:
+      - "5173:5173"
+    environment:
+      - API_HOST=ids    # proxy to the ids service, not localhost
+    depends_on:
+      - ids
+    restart: unless-stopped

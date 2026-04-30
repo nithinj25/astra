@@ -1,0 +1,20 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy source
+COPY ids/       ./ids/
+COPY sim/       ./sim/
+COPY attacker/  ./attacker/
+
+# Pre-train anomaly model at build time (~30s) so startup is instant
+RUN python -c "import sys; sys.path.insert(0,'ids'); import anomaly_model; anomaly_model.initialize()"
+
+EXPOSE 8000
+
+# Start drone simulator in background, then IDS proxy in foreground
+CMD ["sh", "-c", "python sim/drone_sim.py & python ids/ids_proxy.py"]
